@@ -6,7 +6,7 @@ group members :
     BRIAN KINOTI
 ```
 
-A one-on-one chat application built in C, developed as part of a network and distributed programming course. The project is being built incrementally starting from a monolithic architecture with socket communication on a single machine, then later refactored into a full client-server model that can run across two different machines.
+A one-on-one chat application built in C, developed as part of a network and distributed programming course. The project is being built incrementally starting from a monolithic architecture with socket communication on a single machine, then later refactored into a full client-server model that can run across two different machines just as planned.
 
 > **Current status:** Step 1 — user registration and file storage mechanism is implemented. Users can register a username which gets saved to a flat file (`data/users.txt`). Socket communication, messaging, and the full chat loop are not yet implemented.
 this ensures we use the file mechanism as reqeusted by ms Ronge

@@ -1,15 +1,38 @@
-# chat-app
+# One-on-One Chat Application — SCS3304
 
 ```
-group members : 
+Group members:
     JOHN OKELLO     SCS3/2286/2023
     BRIAN KINOTI
 ```
 
-A one-on-one chat application built in C, developed as part of a network and distributed programming course. The project is being built incrementally starting from a monolithic architecture with socket communication on a single machine, then later refactored into a full client-server model that can run across two different machines just as planned.
+A standalone terminal-based one-on-one chat application written in C.
+Built as Assignment 1 for the Networks and Distributed Programming course (SCS3304).
 
-> **Current status:** Step 1 — user registration and file storage mechanism is implemented. Users can register a username which gets saved to a flat file (`data/users.txt`). Socket communication, messaging, and the full chat loop are not yet implemented.
-this ensures we use the file mechanism as reqeusted by ms Ronge
+This is **iteration 1 — standalone (non client-server)**. Two users share one machine.
+Each user logs in, sends and reads messages, then logs out. The next user logs in and
+sees their inbox. No sockets, no network layer — persistence is handled entirely through
+flat text files as required by the course.
+
+---
+
+## Current Status
+
+| Feature | Status |
+|---|---|
+| User registration with password | done |
+| Duplicate username check | done |
+| Password hashing (djb2) | done |
+| Login / logout | done |
+| ONLINE / OFFLINE status tracking | done |
+| Send message to registered user | done |
+| View inbox (all received messages) | done |
+| View conversation thread (both directions) | done |
+| Search user by username | done |
+| List all users with status | done |
+| Delete account (deregister) | done |
+| Flat file persistence (no database) | done |
+
 ---
 
 ## Project Structure
@@ -19,222 +42,206 @@ chat-app/
 ├── README.md
 ├── Makefile
 ├── docs/
-│   ├── diagrams/          # architecture and function tree diagrams
-│   ├── design.md          # architectural and algorithmic write-up
-│   └── protocol.md        # application protocol documentation
+│   ├── diagrams/              # architecture and function tree diagrams
+│   ├── design.md              # architectural and algorithmic write-up
+│   └── protocol.md            # protocol documentation (iteration 2)
 ├── src/
-│   ├── main.c             # entry point
-│   ├── server/
+│   ├── main.c                 # entry point, all menu logic
+│   ├── server/                # reserved for iteration 2 (client-server)
 │   │   ├── server.c
 │   │   └── server.h
-│   ├── client/
+│   ├── client/                # reserved for iteration 2 (client-server)
 │   │   ├── client.c
 │   │   └── client.h
 │   └── common/
-│       ├── protocol.h         # message format constants
-│       ├── utils.c / utils.h  # framing, parsing, timestamps
-│       ├── user_manager.c     # register, deregister, search  ← implemented
-│       ├── user_manager.h     # ← implemented
-│       ├── message_handler.c  # logging, inbox
-│       └── message_handler.h
+│       ├── auth.c / auth.h          # password hashing and verification
+│       ├── user_manager.c / .h      # register, login, logout, search, list
+│       └── message_handler.c / .h   # send, inbox, conversation history
 └── data/
-    ├── users.txt          # registered users (created at runtime)
-    ├── messages.txt       # message store (created at runtime)
-    └── chat_log.txt       # audit log (created at runtime)
+    ├── users.txt              # username:hash:status:last_seen
+    ├── messages.txt           # timestamp|from|to|body
+    └── chat_log.txt           # [timestamp] from -> to : body
 ```
+
+---
+
+## Architecture
+
+```
+main()
+  └── welcome_menu()                     ← login / register / list / exit
+        ├── do_register()                → register_user()
+        │                                  auth: hash_password()
+        ├── do_login()                   → login_user()
+        │                                  auth: verify_password()
+        └── logged_in_menu()             ← shown after successful login
+              ├── do_send_message()      → send_message()   → messages.txt
+              │                                             → chat_log.txt
+              ├── do_inbox()             → show_inbox()     ← messages.txt
+              ├── do_conversation()      → show_conversation()
+              ├── do_search()            → search_user()    ← users.txt
+              ├── do_logout()            → logout_user()    → users.txt
+              └── do_deregister()        → deregister_user()
+```
+
+All user state lives in `data/users.txt`. All messages live in `data/messages.txt`.
+The `data/chat_log.txt` file is an append-only audit trail — nothing is ever deleted from it.
+
+---
+
+## Data File Formats
+
+**data/users.txt** — one line per registered user:
+```
+alice:193548712:OFFLINE:2024-03-14 09:00
+bob:284719234:ONLINE:2024-03-14 10:23
+```
+Fields: `username : password_hash : status : last_seen`
+
+**data/messages.txt** — one line per message sent:
+```
+2024-03-14 10:23:01|alice|bob|hey bob, are you there?
+2024-03-14 10:24:15|bob|alice|yes! what's up?
+```
+Fields: `timestamp | from | to | body`
+
+**data/chat_log.txt** — human-readable audit trail:
+```
+[2024-03-14 10:23:01] alice -> bob : hey bob, are you there?
+[2024-03-14 10:24:15] bob -> alice : yes! what's up?
+```
+
+---
+
+## Password Security
+
+Passwords are never stored as plain text. When a user registers, the password is passed
+through the **djb2 hash algorithm**:
+
+```
+hash = 5381
+for each character c:  hash = hash * 33 + c
+```
+
+The resulting integer is stored as a string in `users.txt`. At login, the entered password
+is hashed again and compared to the stored value. If the hashes match, login succeeds.
+
+> Note: djb2 is not cryptographically secure and is used here because no external
+> libraries are permitted. A production system would use bcrypt or Argon2.
 
 ---
 
 ## Requirements
 
-Before you can build and run this project, you need the following installed on your machine.
-
-=> I use linux , so a bit restructuring might be needed for windows specific devices
-
 ### Linux (Debian / Ubuntu / Kali)
 
-**GCC — the C compiler**
 ```bash
-sudo apt update
-sudo apt install build-essential
-```
-
-`build-essential` installs `gcc`, `g++`, `make`, and other essential compilation tools in one command. Verify it worked:
-```bash
-gcc --version
-```
-
-You should see something like `gcc (Debian 12.2.0) 12.2.0` or similar. Any version above 9 is fine.
-
-**Git — to clone the repo**
-```bash
-sudo apt install git
-```
-
-### macOS
-
-Install the Xcode Command Line Tools — this gives you `gcc` (actually Apple's clang, which is compatible), `make`, and `git` all at once:
-```bash
-xcode-select --install
+sudo apt update && sudo apt install build-essential git
 ```
 
 Verify:
 ```bash
-gcc --version
+gcc --version   # any version above 9 is fine
 make --version
+```
+
+### macOS
+
+```bash
+xcode-select --install
 ```
 
 ### Windows
 
-The easiest path on Windows is to use **WSL (Windows Subsystem for Linux)** and follow the Linux instructions above inside it. Alternatively install **MinGW-w64** for a native Windows gcc, but WSL is strongly recommended for this kind of systems programming.
+Use WSL (Windows Subsystem for Linux) and follow the Linux steps inside it.
 
 ---
 
 ## Getting Started
 
-### 1. Fork and clone the repo
-
-Click **Fork** on the GitHub page, then clone your fork:
 ```bash
+# 1. clone the repo
 git clone https://github.com/John-hack321/chat_app
 cd chat-app
-```
 
-### 2. Create the data directory files
-
-The `data/` folder needs to exist before running the program. If the files are not there yet, create them:
-```bash
+# 2. create the data files (only needed once)
 touch data/users.txt data/messages.txt data/chat_log.txt
-```
 
-### 3. Build
-
-From the root of the project, run:
-```bash
+# 3. build
 make
-```
 
-This compiles all the source files and produces a single binary called `chat` in the project root.
-
-If you want to recompile from scratch:
-```bash
-make clean
-make
-```
-
-### 4. Run
-
-```bash
+# 4. run
 ./chat
 ```
 
-a simple terminal menu will appear on running the app:
-NOTE: in this project we us makefile to controll which files are compiled by the gcc compiler at a time
+To rebuild from scratch:
+```bash
+make clean && make
 ```
-=================================
-   one-on-one chat — step 1
-=================================
 
-  1. register a user
-  2. list all users
-  3. quit
+---
 
+## Usage Walkthrough
+
+```
+╔══════════════════════════════════════════╗
+║      one-on-one chat  —  SCS3304        ║
+║      standalone (non client-server)     ║
+╚══════════════════════════════════════════╝
+
+  1.  login
+  2.  register new account
+  3.  list all users
+  4.  exit
   choice:
 ```
 
-Try registering a few usernames, listing them, and then trying to register the same name twice — it will tell you the username is already taken. Check the actual file that gets written:
-```bash
-cat data/users.txt
-```
+**Typical flow:**
+1. User A registers → sets username + password
+2. User A logs in → sends a message to User B
+3. User A logs out
+4. User B logs in → sees message in inbox → replies
+5. User B logs out
+6. Repeat
 
 ---
 
-## What Is Implemented So Far
+## Module Descriptions
 
-| Feature | Status |
-|---|---|
-| User registration | done |
-| Duplicate username check | done |
-| Save users to flat file (`users.txt`) | done |
-| List all registered users | done |
-| User deregistration | coming next |
-| User search | coming next |
-| Socket communication | coming next |
-| Send / receive messages | coming next |
-| Message inbox | coming next |
-| Full monolith (server + client in one binary) | coming next |
-
----
-
-## Architecture Overview
-
-The application follows a **monolithic architecture** in this first iteration — one single compiled binary that contains both the server-side logic and the client-side logic, communicating internally over TCP on `127.0.0.1`. There is no separate server binary and no separate client binary yet.
-
-The diagram below shows the intended full architecture for the monolith once all steps are complete:
-
-```
-main()
-  ├── server_init()         (parent process — binds to port 8080)
-  │     ├── socket_bind()
-  │     ├── socket_listen()
-  │     └── handle_client() → parse_command() → route_message()
-  │
-  └── client_init()         (child process — connects to 127.0.0.1:8080)
-        ├── socket_connect()
-        └── show_menu()
-              ├── register_user()
-              ├── send_message()
-              ├── display_inbox()
-              ├── search_user()
-              └── deregister_user()
-
-common/
-  ├── frame_message()       solves TCP byte-stream framing
-  ├── parse_message()       parses REG / MSG / SEARCH / DEREG / INBOX commands
-  ├── log_message()         writes to messages.txt and chat_log.txt
-  └── get_timestamp()
-
-data/
-  ├── users.txt             name:status  (e.g. alice:ONLINE)
-  ├── messages.txt          timestamp|from|to|body
-  └── chat_log.txt          append-only audit trail
-```
-
-After the monolith is complete, iteration 2 will split this into separate `server.c` and `client.c` binaries that can run on two different machines over a real network.
-
----
-
-## Application Protocol
-
-All messages sent over the socket follow this format (layer 5 — application protocol):
-// I havent done this part yet but with colaboration we will get it all done soon
-
-| Command | Format | Direction |
+| Module | File | Responsibility |
 |---|---|---|
-| Register | `REG:username` | client → server |
-| Deregister | `DEREG:username` | client → server |
-| Send message | `MSG:from:to:timestamp:body` | client → server |
-| Search user | `SEARCH:username` | client → server |
-| Read inbox | `INBOX:username` | client → server |
-| Acknowledge | `ACK:OK` or `ACK:ERR:reason` | server → client |
+| Entry point + menus | `src/main.c` | All user-facing screens and menu logic |
+| Authentication | `src/common/auth.c` | djb2 password hashing and verification |
+| User management | `src/common/user_manager.c` | Register, login, logout, search, list, deregister |
+| Message handling | `src/common/message_handler.c` | Send, inbox, conversation history, file logging |
 
-Every message is prefixed with a 4-byte length header to handle TCP's byte-stream nature (messages can arrive fragmented — the length header tells the receiver exactly how many bytes to wait for).
+---
+
+## Is Concurrency Required?
+
+No. In the standalone model, only one user is active at a time. Users take turns —
+there is no simultaneous access to shared data. Therefore no threads, no `select()`,
+and no mutex locking is needed.
+
+Concurrency **will** be required in iteration 2 (client-server), where multiple clients
+connect simultaneously and the server must handle them without blocking.
 
 ---
 
 ## Development Notes
 
-- No external libraries are used — only the C standard library and POSIX socket APIs
-- No database — all persistence is done via plain text files in `data/`
-- The code follows top-down analysis and modular programming principles as required by the course
+- No external libraries — only the C standard library
+- No database — flat text files only, as required by Ms. Ronge
+- All file operations check for `NULL` before use
+- Top-down structured programming and modular design throughout
 - Tested on Kali Linux with gcc 12
 
 ---
 
-## Course Context
+## Iterations
 
-This project is part of a networks and distributed programming course. The goals across all iterations are:
-
-- **Iteration 1 (current):** monolithic app, single machine, sockets on localhost
-- **Iteration 2:** client-server model, two separate binaries, two machines
-- **Iteration 3:** group chat, broadcast server, multiple simultaneous clients
+| Iteration | Description | Status |
+|---|---|---|
+| 1 | Standalone, single machine, no sockets | current |
+| 2 | Client-server, two binaries, TCP sockets | upcoming |
+| 3 | Group chat, broadcast, multiple clients | upcoming |

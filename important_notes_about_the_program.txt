@@ -1,4 +1,0 @@
-typedef struct { ... } User — this defines your User data type. Every user has a username (up to 49 characters) and a status. The typedef means you can write User u instead of struct User u — just cleaner syntax.
-
-int register_user(...) and void list_users() — these are declarations, not implementations. They tell the compiler "these functions exist, their full code is in another file."
-

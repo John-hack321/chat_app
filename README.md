@@ -2,8 +2,11 @@
 
 ```
 Group members:
-    JOHN OKELLO     SCS3/2286/2023
-    BRIAN KINOTI
+    JOHN OKELLO           SCS3/2286/2023
+    BRIAN KINOTI          SCS3/146781/2023
+    CHEBII NEHEMIAH KOECH SCS3/145415/2022
+    MANDELA MBELEZI       P15/2108/2021
+    ZACHARIAH ABDI        SCS3/147352/2023
 ```
 
 A standalone terminal-based one-on-one chat application written in C.
@@ -125,9 +128,6 @@ for each character c:  hash = hash * 33 + c
 
 The resulting integer is stored as a string in `users.txt`. At login, the entered password
 is hashed again and compared to the stored value. If the hashes match, login succeeds.
-
-> Note: djb2 is not cryptographically secure and is used here because no external
-> libraries are permitted. A production system would use bcrypt or Argon2.
 
 ---
 

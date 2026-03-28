@@ -21,7 +21,7 @@ flat text files as required by the course.
 
 ## Current Status
 
-| Feature | Status |
+| Feature | Status  |
 |---|---|
 | User registration with password | done |
 | Duplicate username check | done |

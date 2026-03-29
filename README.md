@@ -68,9 +68,9 @@ The server runs as a single process and uses `select()` to watch all connected c
 sockets simultaneously. When any socket has data, `select()` returns and the server
 handles that client, then immediately goes back to watching all sockets again.
 
-This is how real-time delivery works — all client file descriptors live in the same
-process memory. When alice sends to bob, the server finds bob's fd in `clients[]` and
-writes directly to it. No cross-process communication needed.
+for us all the file descriptors live in the same process memory.
+when alice sends to bob , the server finds bob's fd in `clients[]` and 
+writes directly to it , we thus dont do cross-process type of communication
 
 **Client — I/O multiplexing via `select()`**
 
@@ -175,8 +175,7 @@ bob:284719234:ONLINE:2024-03-14 10:23
 
 ## Password Security
 
-Passwords are hashed using the **djb2 algorithm** before being stored. Plain text
-passwords are never written to disk.
+Passwords are hashed using the **djb2 algorithm** before being stored.
 
 ```
 hash = 5381
@@ -191,7 +190,7 @@ for each character c:  hash = hash * 33 + c
 
 ```bash
 sudo apt update && sudo apt install build-essential git
-gcc --version   # any version above 9 is fine
+gcc --version   # versions above 9
 ```
 
 ### macOS

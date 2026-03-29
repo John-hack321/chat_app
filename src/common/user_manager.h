@@ -1,15 +1,3 @@
-/*
- * SCS3304 — One-on-One Chat Application
- * User Manager Module Header
- *
- * Declares the User struct and all user management functions:
- * registration, login, logout, search, list, and deregistration.
- * All user data is persisted to data/users.txt — no database used.
- *
- * File format (one line per user):
- *   username:password_hash:status:last_seen
- */
-
 #ifndef USER_MANAGER_H
 #define USER_MANAGER_H
 

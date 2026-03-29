@@ -9,32 +9,82 @@ Group members:
     ZACHARIAH ABDI        SCS3/147352/2023
 ```
 
-A standalone terminal-based one-on-one chat application written in C.
+A terminal-based one-on-one chat application written in C.
 Built as Assignment 1 for the Networks and Distributed Programming course (SCS3304).
 
-This is **iteration 1 — standalone (non client-server)**. Two users share one machine.
-Each user logs in, sends and reads messages, then logs out. The next user logs in and
-sees their inbox. No sockets, no network layer — persistence is handled entirely through
-flat text files as required by the course.
+This is **iteration 2 — client-server model, single machine**.
+The server and client run as separate binaries communicating over TCP on `127.0.0.1:8080`.
+Two users can chat in real time from two different terminal windows on the same machine.
+
+> Iteration 1 (standalone non client-server) is on the `main` branch.
 
 ---
 
-## Current Status
+## How It Works
 
-| Feature | Status  |
-|---|---|
-| User registration with password | done |
-| Duplicate username check | done |
-| Password hashing (djb2) | done |
-| Login / logout | done |
-| ONLINE / OFFLINE status tracking | done |
-| Send message to registered user | done |
-| View inbox (all received messages) | done |
-| View conversation thread (both directions) | done |
-| Search user by username | done |
-| List all users with status | done |
-| Delete account (deregister) | done |
-| Flat file persistence (no database) | done |
+```
+terminal 1          terminal 2          terminal 3
+./server            ./client            ./client
+    │                   │                   │
+    │←── connect() ─────┤                   │
+    │←── connect() ─────────────────────────┤
+    │                   │                   │
+    │←── LOGIN:alice ───┤                   │
+    │←── LOGIN:bob ─────────────────────────┤
+    │                   │                   │
+    │←── MSG:alice:bob:hello ───────────────┤  alice types
+    │─── DELIVER:alice:hello ───────────────►  bob sees it instantly
+```
+
+Messages arrive in real time — no refreshing, no leaving the chat.
+
+---
+
+## Architecture
+
+```
+server binary (./server)              client binary (./client)
+─────────────────────────             ──────────────────────────
+server_run()                          client_run()
+  └── select() loop                     └── welcome_menu()
+        ├── accept() new clients               ├── screen_login()
+        ├── recv_msg() per client              ├── screen_register()
+        └── handle_command()                   └── logged_in_menu()
+              ├── register_user()                    ├── screen_inbox()
+              ├── login_user()                       ├── screen_start_chat()
+              ├── store_message()                    └── chat_loop()
+              └── find_client()                            └── select()
+                    └── send_msg() ──► DELIVER                   ├── recv incoming
+                                                                 └── send outgoing
+```
+
+---
+
+## Concurrency Design
+
+**Server — I/O multiplexing via `select()`**
+
+The server runs as a single process and uses `select()` to watch all connected client
+sockets simultaneously. When any socket has data, `select()` returns and the server
+handles that client, then immediately goes back to watching all sockets again.
+
+This is how real-time delivery works — all client file descriptors live in the same
+process memory. When alice sends to bob, the server finds bob's fd in `clients[]` and
+writes directly to it. No cross-process communication needed.
+
+**Client — I/O multiplexing via `select()`**
+
+The client's chat loop also uses `select()` to watch two things at once:
+- `stdin` — the user might type a message
+- the socket — the other user might send a message
+
+Whichever becomes ready first gets handled. This is why incoming messages appear
+instantly without blocking the user from typing.
+
+**File locking via `flock()`**
+
+Every write to `data/users.txt` and `data/messages.txt` is protected with `flock()`.
+This prevents data corruption if two clients write simultaneously.
 
 ---
 
@@ -43,52 +93,61 @@ flat text files as required by the course.
 ```
 chat-app/
 ├── README.md
-├── Makefile
+├── Makefile                       # builds ./server and ./client
 ├── docs/
-│   ├── diagrams/              # architecture and function tree diagrams
-│   ├── design.md              # architectural and algorithmic write-up
-│   └── protocol.md            # protocol documentation (iteration 2)
+│   ├── diagrams/
+│   ├── design.md
+│   └── protocol.md
 ├── src/
-│   ├── main.c                 # entry point, all menu logic
-│   ├── server/                # reserved for iteration 2 (client-server)
-│   │   ├── server.c
+│   ├── server_main.c              # entry point → ./server binary
+│   ├── client_main.c              # entry point → ./client binary
+│   ├── server/
+│   │   ├── server.c               # select() loop, handle_command(), find_client()
 │   │   └── server.h
-│   ├── client/                # reserved for iteration 2 (client-server)
-│   │   ├── client.c
+│   ├── client/
+│   │   ├── client.c               # menus, chat_loop() with select()
 │   │   └── client.h
 │   └── common/
-│       ├── auth.c / auth.h          # password hashing and verification
-│       ├── user_manager.c / .h      # register, login, logout, search, list
-│       └── message_handler.c / .h   # send, inbox, conversation history
+│       ├── protocol.h             # command constants, port, buffer sizes
+│       ├── utils.c / utils.h      # send_msg(), recv_msg() — TCP framing
+│       ├── auth.c / auth.h        # djb2 password hashing
+│       ├── user_manager.c / .h    # register, login, logout, search, list
+│       └── message_handler.c / .h # store, inbox, history, recent messages
 └── data/
-    ├── users.txt              # username:hash:status:last_seen
-    ├── messages.txt           # timestamp|from|to|body
-    └── chat_log.txt           # [timestamp] from -> to : body
+    ├── users.txt                  # username:hash:status:last_seen
+    ├── messages.txt               # timestamp|from|to|body
+    └── chat_log.txt               # [timestamp] from -> to : body
 ```
 
 ---
 
-## Architecture
+## Application Protocol (Layer 5)
+
+Every message sent over the TCP socket uses this format:
 
 ```
-main()
-  └── welcome_menu()                     ← login / register / list / exit
-        ├── do_register()                → register_user()
-        │                                  auth: hash_password()
-        ├── do_login()                   → login_user()
-        │                                  auth: verify_password()
-        └── logged_in_menu()             ← shown after successful login
-              ├── do_send_message()      → send_message()   → messages.txt
-              │                                             → chat_log.txt
-              ├── do_inbox()             → show_inbox()     ← messages.txt
-              ├── do_conversation()      → show_conversation()
-              ├── do_search()            → search_user()    ← users.txt
-              ├── do_logout()            → logout_user()    → users.txt
-              └── do_deregister()        → deregister_user()
+[4-byte length header][COMMAND:arg1:arg2:...]
 ```
 
-All user state lives in `data/users.txt`. All messages live in `data/messages.txt`.
-The `data/chat_log.txt` file is an append-only audit trail — nothing is ever deleted from it.
+The 4-byte length header solves TCP's framing problem — TCP is a byte stream with no
+message boundaries. The receiver reads the length first, then reads exactly that many
+bytes to get one complete message.
+
+| Command | Format | Direction |
+|---|---|---|
+| Register | `REG:username:password` | client → server |
+| Login | `LOGIN:username:password` | client → server |
+| Logout | `LOGOUT:username` | client → server |
+| Deregister | `DEREG:username` | client → server |
+| List users | `LIST` | client → server |
+| Search user | `SEARCH:username` | client → server |
+| Send message | `MSG:from:to:body` | client → server |
+| Get inbox | `INBOX:username` | client → server |
+| Get recent | `RECENT:user_a:user_b` | client → server |
+| Get senders | `SENDERS:username` | client → server |
+| Acknowledge | `ACK:OK` or `ACK:ERR:reason` | server → client |
+| Deliver message | `DELIVER:from:body` | server → client |
+| List result | `LIST_RESULT:name:status\|...` | server → client |
 
 ---
 
@@ -99,16 +158,14 @@ The `data/chat_log.txt` file is an append-only audit trail — nothing is ever d
 alice:193548712:OFFLINE:2024-03-14 09:00
 bob:284719234:ONLINE:2024-03-14 10:23
 ```
-Fields: `username : password_hash : status : last_seen`
 
-**data/messages.txt** — one line per message sent:
+**data/messages.txt** — one line per message:
 ```
 2024-03-14 10:23:01|alice|bob|hey bob, are you there?
 2024-03-14 10:24:15|bob|alice|yes! what's up?
 ```
-Fields: `timestamp | from | to | body`
 
-**data/chat_log.txt** — human-readable audit trail:
+**data/chat_log.txt** — append-only audit trail:
 ```
 [2024-03-14 10:23:01] alice -> bob : hey bob, are you there?
 [2024-03-14 10:24:15] bob -> alice : yes! what's up?
@@ -118,16 +175,13 @@ Fields: `timestamp | from | to | body`
 
 ## Password Security
 
-Passwords are never stored as plain text. When a user registers, the password is passed
-through the **djb2 hash algorithm**:
+Passwords are hashed using the **djb2 algorithm** before being stored. Plain text
+passwords are never written to disk.
 
 ```
 hash = 5381
 for each character c:  hash = hash * 33 + c
 ```
-
-The resulting integer is stored as a string in `users.txt`. At login, the entered password
-is hashed again and compared to the stored value. If the hashes match, login succeeds.
 
 ---
 
@@ -137,12 +191,7 @@ is hashed again and compared to the stored value. If the hashes match, login suc
 
 ```bash
 sudo apt update && sudo apt install build-essential git
-```
-
-Verify:
-```bash
 gcc --version   # any version above 9 is fine
-make --version
 ```
 
 ### macOS
@@ -153,25 +202,30 @@ xcode-select --install
 
 ### Windows
 
-Use WSL (Windows Subsystem for Linux) and follow the Linux steps inside it.
+Use WSL and follow the Linux steps.
 
 ---
 
 ## Getting Started
 
 ```bash
-# 1. clone the repo
-git clone https://github.com/John-hack321/chat_app
-cd chat-app
+# 1. switch to the client-server branch
+git checkout client-server
 
-# 2. create the data files (only needed once)
+# 2. create data files (only needed once)
 touch data/users.txt data/messages.txt data/chat_log.txt
 
-# 3. build
+# 3. build both binaries
 make
 
-# 4. run
-./chat
+# 4. terminal 1 — start server first
+./server
+
+# 5. terminal 2 — first user
+./client
+
+# 6. terminal 3 (optional) — second user for live chat test
+./client
 ```
 
 To rebuild from scratch:
@@ -183,26 +237,53 @@ make clean && make
 
 ## Usage Walkthrough
 
+**Terminal 1 (server):**
 ```
-╔══════════════════════════════════════════╗
-║      one-on-one chat  —  SCS3304        ║
-║      standalone (non client-server)     ║
-╚══════════════════════════════════════════╝
+  [*] server listening on 127.0.0.1:8080
+  [*] concurrency: select() I/O multiplexing
+  [*] press Ctrl+C to stop
 
-  1.  login
-  2.  register new account
-  3.  list all users
-  4.  exit
-  choice:
+  [+] new client (fd=4) — 1 connected
+  [+] alice logged in
+  [+] new client (fd=5) — 2 connected
+  [+] bob logged in
 ```
 
-**Typical flow:**
-1. User A registers → sets username + password
-2. User A logs in → sends a message to User B
-3. User A logs out
-4. User B logs in → sees message in inbox → replies
-5. User B logs out
-6. Repeat
+**Terminal 2 (alice):**
+```
+  ╔══════════════════════════════════════════╗
+  ║  chat: alice           ↔  bob           ║
+  ║  /quit to leave                          ║
+  ╚══════════════════════════════════════════╝
+
+  you: hey bob!
+  you:
+```
+
+**Terminal 3 (bob) — message appears instantly:**
+```
+  bob      : hey bob!
+  you:
+```
+
+---
+
+## Current Status
+
+| Feature | Status |
+|---|---|
+| User registration with password | done |
+| Login / logout | done |
+| ONLINE / OFFLINE status | done |
+| Real-time message delivery | done |
+| Conversation history (last 8 messages) | done |
+| Inbox with sender list | done |
+| Search user | done |
+| List all users | done |
+| Delete account | done |
+| TCP framing (length-prefixed messages) | done |
+| select() server concurrency | done |
+| flock() file locking | done |
 
 ---
 
@@ -210,38 +291,21 @@ make clean && make
 
 | Module | File | Responsibility |
 |---|---|---|
-| Entry point + menus | `src/main.c` | All user-facing screens and menu logic |
-| Authentication | `src/common/auth.c` | djb2 password hashing and verification |
-| User management | `src/common/user_manager.c` | Register, login, logout, search, list, deregister |
-| Message handling | `src/common/message_handler.c` | Send, inbox, conversation history, file logging |
-
----
-
-## Is Concurrency Required?
-
-No. In the standalone model, only one user is active at a time. Users take turns —
-there is no simultaneous access to shared data. Therefore no threads, no `select()`,
-and no mutex locking is needed.
-
-Concurrency **will** be required in iteration 2 (client-server), where multiple clients
-connect simultaneously and the server must handle them without blocking.
-
----
-
-## Development Notes
-
-- No external libraries — only the C standard library
-- No database — flat text files only, as required by Ms. Ronge
-- All file operations check for `NULL` before use
-- Top-down structured programming and modular design throughout
-- Tested on Kali Linux with gcc 12
+| Server entry point | `src/server_main.c` | starts `./server` |
+| Client entry point | `src/client_main.c` | starts `./client` |
+| Server logic | `src/server/server.c` | select() loop, command routing, real-time delivery |
+| Client logic | `src/client/client.c` | menus, chat loop with select() |
+| TCP framing | `src/common/utils.c` | send_msg() / recv_msg() with 4-byte length header |
+| Authentication | `src/common/auth.c` | djb2 hashing, password verification |
+| User management | `src/common/user_manager.c` | register, login, logout, flock() writes |
+| Message handling | `src/common/message_handler.c` | store, inbox, history, recent |
 
 ---
 
 ## Iterations
 
-| Iteration | Description | Status |
-|---|---|---|
-| 1 | Standalone, single machine, no sockets | current |
-| 2 | Client-server, two binaries, TCP sockets | upcoming |
-| 3 | Group chat, broadcast, multiple clients | upcoming |
+| Iteration | Branch | Description | Status |
+|---|---|---|---|
+| 1 | `main` | Standalone, single machine, no sockets | complete |
+| 2 | `client-server` | Client-server, TCP sockets, single machine | current |
+| 3 | upcoming | Group chat, broadcast server | upcoming |

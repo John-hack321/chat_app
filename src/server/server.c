@@ -1,49 +1,54 @@
 /*
  * SCS3304 — One-on-One Chat Application
- * Server Module
+ * Server Module — select() I/O multiplexing model
  *
- * HOW THIS SERVER WORKS:
+ * WHY WE SWITCHED FROM fork() TO select():
  *
- *   1. We create one listening socket and bind it to port 8080.
- *      This socket's only job is to wait for incoming connections.
+ *   The previous fork() model created a child process per client.
+ *   Each child had its own memory space, so when child A (alice)
+ *   tried to deliver a message to child B (bob) by writing to
+ *   bob's socket fd — it failed silently. The fd existed in child
+ *   B's memory, not child A's. Real-time delivery was broken.
  *
- *   2. When a client connects, accept() returns a brand new socket
- *      file descriptor just for that client. The listening socket
- *      stays open and keeps waiting for more clients.
+ * HOW select() FIXES THIS:
  *
- *   3. We call fork() immediately after accept(). This creates a
- *      child process that is an exact copy of the server at that
- *      moment. The child closes the listening socket (it doesn't
- *      need it) and handles the client. The parent closes the
- *      client socket (the child has it) and loops back to accept().
+ *   All clients are handled in ONE process. All socket fds live
+ *   in the same memory. When alice sends to bob, the server looks
+ *   up bob's fd in clients[] and writes directly — same process,
+ *   same memory, it works instantly.
  *
- *   4. The child process handles all commands from its client until
- *      the client disconnects, then exits.
+ * CONCURRENCY MODEL — I/O MULTIPLEXING:
  *
- *   CONCURRENCY ACHIEVED:
- *   Multiple clients are handled simultaneously — each in their own
- *   child process. File locks (flock in user_manager and
- *   message_handler) prevent those processes from corrupting shared
- *   data files.
+ *   select() watches a SET of file descriptors and returns as
+ *   soon as ANY one of them has data ready. The server handles
+ *   that fd and immediately loops back to watch all of them again.
+ *   From each client's perspective, the server is always listening.
+ *   This is genuine concurrency — just event-driven rather than
+ *   process-based.
  *
- *   CONNECTED CLIENTS TABLE:
- *   The server maintains a shared table of online clients and their
- *   socket file descriptors. This enables real-time message delivery
- *   — when client A sends a message to client B, the server looks up
- *   B's socket fd and delivers the message instantly if B is online.
+ *   This is the same model used by nginx, Redis, and Node.js.
  *
- *   Because the table is shared between processes (via a memory-mapped
- *   file approach — we use a simple flat file here for clarity), we
- *   protect it with flock as well.
+ * FILE LOCKING — flock():
+ *
+ *   flock() is kept on all file writes even in single-process mode.
+ *   It is good practice and ensures correctness if the program is
+ *   ever extended to a multi-process model.
+ *
+ * THE MAIN LOOP:
+ *   1. Build fd_set: listening socket + all connected client fds
+ *   2. select() — blocks until any fd has data
+ *   3. Listening socket ready → new client → accept() → add to clients[]
+ *   4. Client socket ready → read command → handle → respond
+ *   5. Client disconnected → remove from clients[] → close fd
+ *   6. Repeat
  */
 
  #include <stdio.h>
  #include <string.h>
  #include <stdlib.h>
  #include <unistd.h>
- #include <signal.h>
  #include <sys/socket.h>
- #include <sys/wait.h>
+ #include <sys/select.h>
  #include <sys/file.h>
  #include <netinet/in.h>
  #include <arpa/inet.h>
@@ -54,85 +59,77 @@
  #include "../common/user_manager.h"
  #include "../common/message_handler.h"
  
- /* ── active session: maps username → socket fd ── */
- #define SESSIONS_FILE "data/sessions.txt"
+ /* ── one slot per connected client ── */
+ typedef struct {
+     int  fd;                         /* socket fd — -1 means empty slot */
+     char username[MAX_NAME_LEN + 1]; /* empty string means not logged in */
+ } Client;
  
- /* ── write username:fd to sessions file so other processes can find it ── */
- static void session_register(const char *username, int fd) {
-     FILE *fp = fopen(SESSIONS_FILE, "a");
-     if (fp == NULL) return;
-     flock(fileno(fp), LOCK_EX);
-     fprintf(fp, "%s:%d\n", username, fd);
-     flock(fileno(fp), LOCK_UN);
-     fclose(fp);
- }
+ static Client clients[MAX_USERS];
+ static int    client_count = 0;
  
- /* ── remove a username from the sessions file on logout/disconnect ── */
- static void session_remove(const char *username) {
-     char lines[MAX_USERS][64];
-     int  count = 0;
- 
-     FILE *fp = fopen(SESSIONS_FILE, "r");
-     if (fp == NULL) return;
-     flock(fileno(fp), LOCK_SH);
-     while (count < MAX_USERS && fgets(lines[count], 64, fp) != NULL)
-         count++;
-     flock(fileno(fp), LOCK_UN);
-     fclose(fp);
- 
-     fp = fopen(SESSIONS_FILE, "w");
-     if (fp == NULL) return;
-     flock(fileno(fp), LOCK_EX);
-     for (int i = 0; i < count; i++) {
-         char name[50];
-         sscanf(lines[i], "%49[^:]", name);
-         if (strcasecmp(name, username) != 0)
-             fputs(lines[i], fp);
+ /* ============================================================
+  * FUNCTION : find_client
+  * PURPOSE  : Look up a connected client by username.
+  *            Returns a pointer to their slot, or NULL.
+  *
+  *   This is what enables real-time delivery — we find the
+  *   recipient's fd directly in our own process memory and
+  *   write to it immediately. No cross-process issues.
+  * ============================================================ */
+ static Client *find_client(const char *username) {
+     for (int i = 0; i < client_count; i++) {
+         if (clients[i].fd > 0 &&
+             strcasecmp(clients[i].username, username) == 0)
+             return &clients[i];
      }
-     flock(fileno(fp), LOCK_UN);
-     fclose(fp);
+     return NULL;
  }
  
- /* ── look up the socket fd for a connected user ── */
- static int session_find_fd(const char *username) {
-     FILE *fp = fopen(SESSIONS_FILE, "r");
-     if (fp == NULL) return -1;
+ /* ============================================================
+  * FUNCTION : remove_client
+  * PURPOSE  : Clean up a disconnected client.
+  *            Logs them out, closes their fd, removes from array.
+  * ============================================================ */
+ static void remove_client(int fd) {
+     for (int i = 0; i < client_count; i++) {
+         if (clients[i].fd != fd) continue;
  
-     flock(fileno(fp), LOCK_SH);
-     char line[64];
-     char name[50];
-     int  fd;
-     int  result = -1;
- 
-     while (fgets(line, sizeof(line), fp) != NULL) {
-         if (sscanf(line, "%49[^:]:%d", name, &fd) == 2) {
-             if (strcasecmp(name, username) == 0) { result = fd; break; }
+         if (clients[i].username[0] != '\0') {
+             logout_user(clients[i].username);
+             printf("  [*] %s disconnected\n", clients[i].username);
          }
+ 
+         /* shift remaining slots down to fill the gap */
+         for (int j = i; j < client_count - 1; j++)
+             clients[j] = clients[j + 1];
+ 
+         client_count--;
+         close(fd);
+         return;
      }
-     flock(fileno(fp), LOCK_UN);
-     fclose(fp);
-     return result;
  }
  
  /* ============================================================
   * FUNCTION : handle_command
-  * PURPOSE  : Parse and execute one command from a client
-  * INPUT    : client_fd      — socket for this client
-  *            cmd            — the command string received
-  *            session_user   — buffer holding logged-in username
-  *                             (empty string = not logged in)
+  * PURPOSE  : Parse and execute one command received from a client.
+  *
+  *   Format:  COMMAND:arg1:arg2:...
+  *
+  *   The command word is extracted first (everything before the
+  *   first colon), then arguments are parsed per command type.
+  *
+  * INPUT : c   — pointer to the sending client's slot
+  *         cmd — the full command string received
   * ============================================================ */
- static void handle_command(int client_fd, char *cmd, char *session_user) {
+ static void handle_command(Client *c, char *cmd) {
      char response[BUFFER_SIZE];
-     char command[16] = {0};
-     char a1[50]      = {0};
-     char a2[50]      = {0};
+     char command[16]        = {0};
+     char a1[50]             = {0};
+     char a2[50]             = {0};
      char body[MAX_BODY_LEN] = {0};
  
-     /*
-      * Extract the command word — everything before the first colon.
-      * e.g.  "LOGIN:alice:pass"  →  command = "LOGIN"
-      */
+     /* extract command word — everything before the first colon */
      sscanf(cmd, "%15[^:]", command);
  
      /* ── REGISTER ── REG:username:password ── */
@@ -141,9 +138,9 @@
          int r = register_user(a1, a2);
          if      (r == SUCCESS)       snprintf(response, sizeof(response), CMD_ACK_OK);
          else if (r == ERR_DUPLICATE) snprintf(response, sizeof(response), "%s:username already taken", CMD_ACK_ERR);
-         else if (r == ERR_INVALID)   snprintf(response, sizeof(response), "%s:invalid username or password too short", CMD_ACK_ERR);
+         else if (r == ERR_INVALID)   snprintf(response, sizeof(response), "%s:password too short (min 4 chars)", CMD_ACK_ERR);
          else                         snprintf(response, sizeof(response), "%s:server error", CMD_ACK_ERR);
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
      /* ── LOGIN ── LOGIN:username:password ── */
@@ -151,40 +148,37 @@
          sscanf(cmd, "%*[^:]:%49[^:]:%49[^\n]", a1, a2);
          int r = login_user(a1, a2);
          if (r == SUCCESS) {
-             strncpy(session_user, a1, MAX_NAME_LEN);
-             session_register(a1, client_fd);
-             printf("  [+] %s logged in (fd=%d)\n", a1, client_fd);
-             send_msg(client_fd, CMD_ACK_OK);
-         } else if (r == ERR_NOT_FOUND)  { snprintf(response, sizeof(response), "%s:user not found",    CMD_ACK_ERR); send_msg(client_fd, response); }
-         else if   (r == ERR_WRONG_PASS) { snprintf(response, sizeof(response), "%s:wrong password",    CMD_ACK_ERR); send_msg(client_fd, response); }
-         else if   (r == ERR_ALREADY_ON) { snprintf(response, sizeof(response), "%s:already logged in", CMD_ACK_ERR); send_msg(client_fd, response); }
-         else                            { snprintf(response, sizeof(response), "%s:login failed",       CMD_ACK_ERR); send_msg(client_fd, response); }
+             strncpy(c->username, a1, MAX_NAME_LEN);
+             printf("  [+] %s logged in\n", a1);
+             send_msg(c->fd, CMD_ACK_OK);
+         } else if (r == ERR_NOT_FOUND)  { snprintf(response, sizeof(response), "%s:user not found",    CMD_ACK_ERR); send_msg(c->fd, response); }
+         else if   (r == ERR_WRONG_PASS) { snprintf(response, sizeof(response), "%s:wrong password",    CMD_ACK_ERR); send_msg(c->fd, response); }
+         else if   (r == ERR_ALREADY_ON) { snprintf(response, sizeof(response), "%s:already logged in", CMD_ACK_ERR); send_msg(c->fd, response); }
+         else                            { snprintf(response, sizeof(response), "%s:login failed",       CMD_ACK_ERR); send_msg(c->fd, response); }
      }
  
      /* ── LOGOUT ── LOGOUT:username ── */
      else if (strcmp(command, CMD_LOGOUT) == 0) {
          sscanf(cmd, "%*[^:]:%49[^\n]", a1);
          logout_user(a1);
-         session_remove(a1);
-         session_user[0] = '\0';
          printf("  [*] %s logged out\n", a1);
-         send_msg(client_fd, CMD_ACK_OK);
+         c->username[0] = '\0';
+         send_msg(c->fd, CMD_ACK_OK);
      }
  
      /* ── DEREGISTER ── DEREG:username ── */
      else if (strcmp(command, CMD_DEREGISTER) == 0) {
          sscanf(cmd, "%*[^:]:%49[^\n]", a1);
          logout_user(a1);
-         session_remove(a1);
-         int r = deregister_user(a1);
-         session_user[0] = '\0';
-         send_msg(client_fd, r == SUCCESS ? CMD_ACK_OK : CMD_ACK_ERR);
+         deregister_user(a1);
+         c->username[0] = '\0';
+         send_msg(c->fd, CMD_ACK_OK);
      }
  
      /* ── LIST ── LIST ── */
      else if (strcmp(command, CMD_LIST) == 0) {
          build_user_list(response, sizeof(response));
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
      /* ── SEARCH ── SEARCH:username ── */
@@ -195,140 +189,96 @@
                       a1, is_online(a1) ? STATUS_ONLINE : STATUS_OFFLINE);
          else
              snprintf(response, sizeof(response), "SEARCH_RESULT:not_found");
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
      /* ── SEND MESSAGE ── MSG:from:to:body ── */
      else if (strcmp(command, CMD_MSG) == 0) {
          /*
-          * Parse: skip "MSG:", read from, to, then everything
-          * remaining is the body (it may contain colons).
+          * Body may contain colons so we read everything after
+          * the third colon as one field with %1023[^\n].
           */
          sscanf(cmd, "%*[^:]:%49[^:]:%49[^:]:%1023[^\n]", a1, a2, body);
  
-         /* store to file */
+         /* persist to file first */
          int r = store_message(a1, a2, body);
          if (r != SUCCESS) {
              snprintf(response, sizeof(response), "%s:recipient not found", CMD_ACK_ERR);
-             send_msg(client_fd, response);
+             send_msg(c->fd, response);
              return;
          }
  
          /*
-          * Real-time delivery: look up recipient's socket fd.
-          * Only deliver to the RECIPIENT (a2), never back to the
-          * sender (a1/client_fd) — the sender already echoed their
-          * own message locally so delivering it again causes duplicates.
+          * Real-time delivery — the key advantage of select().
+          *
+          * find_client() searches clients[] in this same process.
+          * The fd it returns is immediately usable with send_msg().
+          * No cross-process fd sharing needed.
+          *
+          * We only deliver to the RECIPIENT — not back to the sender.
+          * The sender already echoed their own message locally in
+          * the client's chat loop.
           */
-         int recipient_fd = session_find_fd(a2);
-         if (recipient_fd > 0 && recipient_fd != client_fd) {
+         Client *recipient = find_client(a2);
+         if (recipient != NULL && recipient->fd != c->fd) {
              char deliver[BUFFER_SIZE];
-             snprintf(deliver, sizeof(deliver), "%s:%s:%s", CMD_DELIVER, a1, body);
-             send_msg(recipient_fd, deliver);
+             snprintf(deliver, sizeof(deliver), "%s:%s:%s",
+                      CMD_DELIVER, a1, body);
+             send_msg(recipient->fd, deliver);
          }
  
-         /*
-          * Send ACK:OK back to the sender so the client knows the
-          * message was stored. We use a silent ACK that the chat loop
-          * will receive and discard — it does NOT print anything.
-          */
-         send_msg(client_fd, CMD_ACK_OK);
+         /* ACK to sender — client chat loop discards this silently */
+         send_msg(c->fd, CMD_ACK_OK);
      }
  
      /* ── INBOX ── INBOX:username ── */
      else if (strcmp(command, CMD_INBOX) == 0) {
          sscanf(cmd, "%*[^:]:%49[^\n]", a1);
          build_inbox_str(a1, response, sizeof(response));
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
-     /* ── HISTORY ── HISTORY:user_a:user_b ── */
-     else if (strcmp(command, CMD_HISTORY) == 0) {
-         /* history is displayed on client side using shared files */
-         send_msg(client_fd, CMD_ACK_OK);
-     }
- 
-     /* ── RECENT ── RECENT:user_a:user_b — last 8 messages between them ── */
+     /* ── RECENT ── RECENT:user_a:user_b ── */
      else if (strcmp(command, CMD_RECENT) == 0) {
          sscanf(cmd, "%*[^:]:%49[^:]:%49[^\n]", a1, a2);
          build_recent_str(a1, a2, 8, response, sizeof(response));
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
-     /* ── SENDERS ── SENDERS:username — who has messaged this user ── */
+     /* ── SENDERS ── SENDERS:username ── */
      else if (strcmp(command, "SENDERS") == 0) {
          sscanf(cmd, "%*[^:]:%49[^\n]", a1);
          build_inbox_senders(a1, response, sizeof(response));
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
  
      /* ── unknown command ── */
      else {
          snprintf(response, sizeof(response), "%s:unknown command", CMD_ACK_ERR);
-         send_msg(client_fd, response);
+         send_msg(c->fd, response);
      }
- }
- 
- /* ============================================================
-  * FUNCTION : client_session
-  * PURPOSE  : Handle one connected client until they disconnect.
-  *            Runs in a child process created by fork().
-  * INPUT    : client_fd — socket for this client
-  * ============================================================ */
- static void client_session(int client_fd) {
-     char buf[BUFFER_SIZE];
-     char session_user[MAX_NAME_LEN + 1] = "";   /* empty = not logged in */
- 
-     while (1) {
-         /*
-          * recv_msg blocks until a complete message arrives.
-          * Returns -1 when the client closes the connection.
-          */
-         if (recv_msg(client_fd, buf, sizeof(buf)) < 0) break;
-         handle_command(client_fd, buf, session_user);
-     }
- 
-     /* clean up when client disconnects unexpectedly */
-     if (session_user[0] != '\0') {
-         logout_user(session_user);
-         session_remove(session_user);
-         printf("  [*] %s disconnected (session ended)\n", session_user);
-     }
-     close(client_fd);
  }
  
  /* ============================================================
   * FUNCTION : server_run
-  * PURPOSE  : Main server loop — bind, listen, accept, fork
+  * PURPOSE  : Bind, listen, then run the select() loop forever.
   * ============================================================ */
  void server_run(void) {
      int server_fd;
      struct sockaddr_in addr;
      int opt = 1;
  
-     /*
-      * SIGCHLD: when a child process (forked per client) finishes,
-      * the OS sends SIGCHLD to the parent. Setting it to SIG_IGN
-      * tells the OS to automatically clean up zombie processes
-      * without us needing to call wait() manually.
-      */
-     signal(SIGCHLD, SIG_IGN);
+     /* initialise all client slots to empty */
+     for (int i = 0; i < MAX_USERS; i++) {
+         clients[i].fd = -1;
+         clients[i].username[0] = '\0';
+     }
  
-     /* clear sessions file on startup */
-     FILE *sf = fopen(SESSIONS_FILE, "w");
-     if (sf) fclose(sf);
- 
-     /* ── step 1: create the TCP socket ── */
-     server_fd = socket(AF_INET,     /* IPv4                  */
-                        SOCK_STREAM, /* TCP (reliable stream) */
-                        0);          /* protocol auto-select  */
+     /* ── step 1: create TCP socket ── */
+     server_fd = socket(AF_INET, SOCK_STREAM, 0);
      if (server_fd < 0) { perror("  [!] socket() failed"); exit(1); }
  
-     /*
-      * SO_REUSEADDR: if the server crashes and restarts, the port
-      * may still be marked "in use" by the OS for a short time.
-      * This option lets us bind again immediately.
-      */
+     /* allow immediate port reuse after server restart */
      setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
  
      /* ── step 2: bind to 127.0.0.1:8080 ── */
@@ -342,60 +292,79 @@
          exit(1);
      }
  
-     /* ── step 3: listen — mark socket as passive/accepting ── */
+     /* ── step 3: listen ── */
      if (listen(server_fd, BACKLOG) < 0) {
          perror("  [!] listen() failed");
          exit(1);
      }
  
      printf("  [*] server listening on %s:%d\n", SERVER_IP, SERVER_PORT);
-     printf("  [*] waiting for clients — press Ctrl+C to stop\n\n");
+     printf("  [*] concurrency: select() I/O multiplexing\n");
+     printf("  [*] press Ctrl+C to stop\n\n");
  
-     /* ── step 4: accept loop ── */
+     /* ── step 4: select() loop ── */
      while (1) {
-         struct sockaddr_in client_addr;
-         socklen_t addr_len = sizeof(client_addr);
+         fd_set read_fds;
+         FD_ZERO(&read_fds);
+ 
+         /* always watch the listening socket for new connections */
+         FD_SET(server_fd, &read_fds);
+         int max_fd = server_fd;
+ 
+         /* add every active client fd to the watch set */
+         for (int i = 0; i < client_count; i++) {
+             if (clients[i].fd > 0) {
+                 FD_SET(clients[i].fd, &read_fds);
+                 if (clients[i].fd > max_fd)
+                     max_fd = clients[i].fd;
+             }
+         }
  
          /*
-          * accept() BLOCKS here — the process sleeps until a client
-          * connects. When one does, it returns a new socket fd
-          * dedicated to that client. The original server_fd stays
-          * open and keeps listening.
+          * select() blocks until at least one fd is readable.
+          * On return, read_fds only has bits set for the fds that
+          * actually have data ready — we check each one below.
           */
-         int client_fd = accept(server_fd,
-                                (struct sockaddr *)&client_addr,
-                                &addr_len);
-         if (client_fd < 0) { perror("  [!] accept() failed"); continue; }
+         if (select(max_fd + 1, &read_fds, NULL, NULL, NULL) < 0)
+             continue;
  
-         printf("  [+] client connected from %s (fd=%d)\n",
-                inet_ntoa(client_addr.sin_addr), client_fd);
+         /* ── new client connecting ── */
+         if (FD_ISSET(server_fd, &read_fds)) {
+             struct sockaddr_in client_addr;
+             socklen_t addr_len = sizeof(client_addr);
+             int client_fd = accept(server_fd,
+                                    (struct sockaddr *)&client_addr,
+                                    &addr_len);
+             if (client_fd < 0) {
+                 perror("  [!] accept() failed");
+             } else if (client_count >= MAX_USERS) {
+                 send_msg(client_fd, "ACK:ERR:server full");
+                 close(client_fd);
+             } else {
+                 clients[client_count].fd = client_fd;
+                 clients[client_count].username[0] = '\0';
+                 client_count++;
+                 printf("  [+] new client (fd=%d) — %d connected\n",
+                        client_fd, client_count);
+             }
+         }
  
          /*
-          * fork() — create a child process.
-          *
-          * After fork():
-          *   pid == 0  → we are in the CHILD  process
-          *   pid >  0  → we are in the PARENT process
-          *   pid <  0  → fork failed (error)
-          *
-          * The child handles this client then exits.
-          * The parent closes the client fd and loops back to accept().
+          * Check each client for incoming data.
+          * Index-based loop because remove_client() shifts the array —
+          * we decrement i after removal to re-check the same index.
           */
-         pid_t pid = fork();
+         for (int i = 0; i < client_count; i++) {
+             int fd = clients[i].fd;
+             if (fd <= 0 || !FD_ISSET(fd, &read_fds)) continue;
  
-         if (pid == 0) {
-             /* ── CHILD: handle client ── */
-             close(server_fd);       /* child doesn't need the listening socket */
-             client_session(client_fd);
-             exit(0);
- 
-         } else if (pid > 0) {
-             /* ── PARENT: go back to accepting ── */
-             close(client_fd);       /* parent doesn't need this client's socket */
- 
-         } else {
-             perror("  [!] fork() failed");
-             close(client_fd);
+             char buf[BUFFER_SIZE];
+             if (recv_msg(fd, buf, sizeof(buf)) < 0) {
+                 remove_client(fd);
+                 i--;   /* compensate for array shift after removal */
+             } else {
+                 handle_command(&clients[i], buf);
+             }
          }
      }
  }
